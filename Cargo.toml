@@ -10,4 +10,5 @@ edition = "2018"
 iced = "0.3"
 iced_native = "0.4"
 serde_json = "*"
+csv = "*"
 serde = {version = "*", features = ["derive"]}

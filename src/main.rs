@@ -2,11 +2,11 @@ use iced::{
     button,
     container::{Style, StyleSheet},
     executor, Align, Application, Button, Checkbox, Clipboard, Column, Command, Container, Element,
-    Settings, Subscription, Text, TextInput,
+    Settings, Subscription, Text,
 };
 use iced_native::{keyboard, Event};
 use serde::{Deserialize, Serialize};
-use std::{cmp::min, fs::File, path::Path};
+use std::{cmp::min, collections::HashSet, fs::File, io::BufRead, path::Path};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -14,9 +14,9 @@ type Error = Box<dyn std::error::Error>;
 pub enum Message {
     NextRow,
     PrevRow,
-    Input(String),
     Matches(bool),
     ToggleMatches,
+    CodeToggle(String, bool),
     Ignore,
 }
 
@@ -43,7 +43,14 @@ struct Entry {
     response: String,
     ratings: Vec<String>,
     matches: Option<bool>,
-    codes: Option<String>,
+    codes: HashSet<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Code {
+    theme: String,
+    tag: String,
+    code: String,
 }
 
 struct Viewer {
@@ -56,17 +63,18 @@ struct Viewer {
 
     // The rows
     data: Vec<Entry>,
+    codes: Vec<Code>,
+    themes: Vec<String>,
 
     // The local state of the two buttons
     next_btn: button::State,
     prev_btn: button::State,
-    codes_input_state: iced::text_input::State,
 }
 
 impl Viewer {
     fn save(&self) -> Result<(), Error> {
         let file = File::create(&self.output_file_path)?;
-        serde_json::to_writer(file, &self.data)?;
+        serde_json::to_writer_pretty(file, &self.data)?;
         Ok(())
     }
 
@@ -87,15 +95,29 @@ impl Application for Viewer {
     fn new(_flags: Self::Flags) -> (Self, Command<Message>) {
         let args: Vec<String> = std::env::args().collect();
 
-        assert_eq!(args.len(), 3);
+        assert_eq!(args.len(), 4);
 
         let file_path = Path::new(&args[1]);
-        let output_file_path = Path::new(&args[2]);
+        let code_path = Path::new(&args[2]);
+        let output_file_path = Path::new(&args[3]);
         let file = std::fs::File::open(&file_path).expect(&format!(
             "Could not open file: {}",
             file_path.to_str().get_or_insert(&args[1])
         ));
         let data: Vec<Entry> = serde_json::from_reader(file).expect("Parsing json...");
+        let file = std::fs::File::open(&code_path).expect(&format!(
+            "Could not open codes file: {}",
+            code_path.to_str().get_or_insert(&args[2])
+        ));
+
+        let codes: Vec<Code> = csv::Reader::from_reader(file)
+            .deserialize()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut themes: Vec<String> = codes.iter().map(|c| c.theme.clone()).collect();
+        themes.sort();
+        themes.dedup();
 
         (
             Self {
@@ -103,9 +125,10 @@ impl Application for Viewer {
                 output_file_path: output_file_path.into(),
                 idx: 0,
                 data,
+                codes,
+                themes,
                 next_btn: button::State::default(),
                 prev_btn: button::State::default(),
-                codes_input_state: iced::text_input::State::default(),
             },
             Command::none(),
         )
@@ -124,12 +147,17 @@ impl Application for Viewer {
             Message::NextRow => self.idx = min(self.idx + 1, self.data.len() - 1),
             Message::PrevRow => self.idx = self.idx.saturating_sub(1),
             // TODO REALLY need to do better error handling...
-            Message::Input(input) => {
-                self.curr_mut().codes = Some(input);
-                self.save().expect("Saving file");
-            }
             Message::Matches(matches) => {
                 self.curr_mut().matches = Some(matches);
+                self.save().expect("Saving file");
+            }
+            Message::CodeToggle(tag, state) => {
+                let curr = self.curr_mut();
+                if state {
+                    curr.codes.insert(tag);
+                } else {
+                    curr.codes.remove(&tag);
+                }
                 self.save().expect("Saving file");
             }
             Message::ToggleMatches => {
@@ -193,26 +221,38 @@ impl Application for Viewer {
             .padding(10)
             .push(Text::new(&self.data[self.idx].response));
 
-        let input = iced::Row::new()
-            .padding(10)
-            .push(Checkbox::new(
-                *self.data[self.idx].matches.get_or_insert(false),
-                "Matches",
-                Message::Matches,
-            ))
-            .spacing(10)
-            .push(TextInput::new(
-                &mut self.codes_input_state,
-                "Codes",
-                &self.data[self.idx].codes.get_or_insert("".to_string()),
-                Message::Input,
-            ));
+        let input = iced::Row::new().padding(10).push(Checkbox::new(
+            *self.data[self.idx].matches.get_or_insert(false),
+            "Matches",
+            Message::Matches,
+        ));
+
+        let mut codes = iced::Column::new();
+        for row_idx in 0..self.themes.len() / 5 {
+            let mut row = iced::Row::new();
+            let start_idx = row_idx * 5;
+            let end_idx = min((row_idx + 1) * 5, self.themes.len());
+            for theme in self.themes[start_idx..end_idx].iter() {
+                let mut theme_col = iced::Column::new().push(Text::new(theme)).padding(10);
+                for code in self.codes.iter().filter(|c| c.theme == *theme) {
+                    let tag: String = code.tag.to_string();
+                    let toggle: bool = self.data[self.idx].codes.contains(&tag);
+                    let checkbox = Checkbox::new(toggle, &code.code.clone(), move |b| {
+                        Message::CodeToggle(tag.clone(), b)
+                    });
+                    theme_col = theme_col.push(checkbox);
+                }
+                row = row.push(theme_col);
+            }
+            codes = codes.push(row);
+        }
 
         let content = Column::new()
             .padding(20)
             .push(title)
             .push(ratings)
             .push(input)
+            .push(codes)
             .push(text)
             .push(footer);
 
